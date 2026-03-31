@@ -18,6 +18,10 @@ from homeassistant.helpers.event import (
 from homeassistant.util import dt as dt_util
 from pymodbus.server import StartAsyncSerialServer
 from pymodbus.framer import FramerType
+try:
+    import pymodbus.transport.transport as _pymodbus_transport
+except (ImportError, TypeError):
+    _pymodbus_transport = None  # type: ignore[assignment]
 from .modbus_server import (
     context,
     identity,
@@ -26,6 +30,52 @@ from .modbus_server import (
 from .sdm630_input_registers import TOTAL_POWER
 from . import sdm630_input_registers as _input_regs
 from . import CONF_ENTITIES, CONF_REGISTER_MAPPINGS, DEFAULTS, DOMAIN
+
+# ── RS485 Echo Suppression Monkey-Patch ───────────────────────────────────────
+# The Waveshare USB-RS485 adapter (FT232RNL + SP485EEN) uses an RC delay circuit
+# for automatic direction control.  This causes the server to receive a corrupted
+# echo of every response it sends.  pymodbus's built-in handle_local_echo uses a
+# byte-level content comparison (startswith) which fails on corrupted echoes.
+#
+# This patch replaces the comparison with length-based suppression: after sending
+# N bytes, the next N received bytes are silently discarded regardless of content.
+# This is safe because at 9600 baud the echo completes in ~100 ms while the THOR
+# wallbox polls only every ~60 s, so echo and real requests never overlap.
+if _pymodbus_transport is not None:
+    from pymodbus.logging import Log as _PymbLog
+
+    _original_datagram_received = _pymodbus_transport.ModbusProtocol.datagram_received
+
+    def _echo_aware_datagram_received(
+        self: _pymodbus_transport.ModbusProtocol,
+        data: bytes,
+        addr: tuple | None,
+    ) -> None:
+        """Drop TX echo by byte count instead of content comparison."""
+        if self.comm_params.handle_local_echo and self.sent_buffer:
+            skip = min(len(data), len(self.sent_buffer))
+            _PymbLog.debug(
+                "recv skipping {} echo bytes (length-based), remaining sent_buffer={}",
+                skip,
+                len(self.sent_buffer) - skip,
+            )
+            self.sent_buffer = self.sent_buffer[skip:]
+            data = data[skip:]
+            if not data:
+                return
+        # ---- normal receive path (copied from original, minus echo branch) ----
+        _PymbLog.transport_dump(_PymbLog.RECV_DATA, data, self.recv_buffer)
+        if len(self.recv_buffer) > 1024:
+            self.recv_buffer = b""
+        self.recv_buffer += data
+        cut = self.callback_data(self.recv_buffer, addr=addr)
+        self.recv_buffer = self.recv_buffer[cut:]
+        if self.recv_buffer:
+            _PymbLog.transport_dump(_PymbLog.EXTRA_DATA, None, self.recv_buffer)
+
+    _pymodbus_transport.ModbusProtocol.datagram_received = _echo_aware_datagram_received  # type: ignore[assignment]
+
+# ── End Monkey-Patch ──────────────────────────────────────────────────────────
 
 # Maps register constant names (e.g. "PHASE_1_VOLTAGE") to their PDU addresses.
 # Built dynamically from all uppercase int attributes in sdm630_input_registers.
@@ -82,7 +132,7 @@ async def start_modbus_server() -> None:
             bytesize=8,
             parity="E",
             baudrate=9600,
-            handle_local_echo=False,
+            handle_local_echo=True,
             ignore_missing_slaves=True,
         )
     except Exception as e:
