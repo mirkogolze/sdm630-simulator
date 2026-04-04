@@ -122,6 +122,16 @@ SDM630_PORT: str = "/dev/ttyUSB0"
 async def start_modbus_server() -> None:
     """Start the Modbus RTU serial server."""
     try:
+        if _pymodbus_transport is not None:
+            _LOGGER.warning(
+                "RS485 echo patch: ACTIVE (length-based datagram_received installed on %s)",
+                _pymodbus_transport.ModbusProtocol.datagram_received.__name__,
+            )
+        else:
+            _LOGGER.warning(
+                "RS485 echo patch: INACTIVE — pymodbus.transport.transport import failed; "
+                "echo bytes will pollute the recv_buffer."
+            )
         _LOGGER.info("Starting SDM630 Modbus Serial Simulator on %s...", SDM630_PORT)
         await StartAsyncSerialServer(
             context=context,
