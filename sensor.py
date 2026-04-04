@@ -23,6 +23,10 @@ try:
     from pymodbus.server import ModbusSerialServer as _ModbusSerialServer
 except ImportError:
     _ModbusSerialServer = None  # type: ignore[assignment,misc]
+try:
+    from pymodbus.transport.serialtransport import SerialTransport as _SerialTransport
+except ImportError:
+    _SerialTransport = None  # type: ignore[assignment]
 from .modbus_server import (
     context,
     identity,
@@ -33,89 +37,58 @@ from . import sdm630_input_registers as _input_regs
 from . import CONF_ENTITIES, CONF_REGISTER_MAPPINGS, DEFAULTS, DOMAIN
 
 
-# ── RS485 Echo Filter — asyncio transport level ───────────────────────────────
-# RC-delay adapters (Waveshare FT232RNL + SP485EEN) echo every sent byte back on
-# RX. The echo bytes are bit-corrupted (RC timing ≠ 9600 baud), so pymodbus's
-# built-in handle_local_echo (content-based startswith) never matches.
+# ── RS485 Echo Filter — SerialTransport class-level patch ─────────────────────
+# RC-delay adapters (Waveshare FT232RNL + SP485EEN) echo every sent byte back
+# on RX. The echo bytes are bit-corrupted so pymodbus's built-in
+# handle_local_echo (content startswith check) never matches. The protocol-
+# wrapper approach (_RS485EchoFilter) also failed: connection_made is invoked
+# via call_soon AFTER add_reader, so data can arrive before the write-hook is
+# installed.
 #
-# Strategy: intercept at asyncio transport level — before pymodbus ever touches
-# the bytes. We wrap transport.write() to count outgoing bytes, then discard the
-# same count of incoming bytes in data_received(). No content comparison needed.
-class _RS485EchoFilter(asyncio.Protocol):
-    """Asyncio protocol wrapper that strips RS485 TX echoes by byte count.
+# This patch operates at the pyserial I/O layer, one level below asyncio:
+#   - SerialTransport.write()           → counts bytes going out (_echo_pending)
+#   - SerialTransport.intern_read_ready() → discards leading pending bytes
+#     BEFORE passing data to the protocol (i.e. before pymodbus ever sees them)
+#
+# Safe because at 9600 baud the echo window is ~100 ms and THOR polls every
+# ~60 s, so echo and real requests never overlap.
+_echo_pending: dict[int, int] = {}   # id(SerialTransport instance) → pending echo bytes
 
-    Injected as the protocol factory for ModbusSerialServer so pymodbus never
-    receives echo bytes. All attribute access is delegated to the inner
-    ServerRequestHandler so pymodbus's internal bookkeeping is unaffected.
-    """
+if _SerialTransport is not None:
+    _orig_st_write = _SerialTransport.write
+    _orig_st_read_ready = _SerialTransport.intern_read_ready
 
-    __slots__ = ("_inner", "_pending")
+    def _st_write(self: _SerialTransport, data: bytes) -> None:  # type: ignore[misc]
+        """Track outgoing bytes so the matching echo can be discarded on RX."""
+        _echo_pending[id(self)] = _echo_pending.get(id(self), 0) + len(data)
+        _orig_st_write(self, data)
 
-    def __init__(self, inner: asyncio.Protocol) -> None:
-        self._inner = inner
-        self._pending: int = 0
-
-    # ── attribute delegation so pymodbus internal accesses work ──────────────
-    def __getattr__(self, name: str):
-        return getattr(self._inner, name)
-
-    def __setattr__(self, name: str, value) -> None:  # type: ignore[override]
-        if name in ("_inner", "_pending"):
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._inner, name, value)
-
-    # ── asyncio.Protocol interface ────────────────────────────────────────────
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        orig_write = transport.write
-        ref = self
-
-        def _tracked_write(data: bytes, _orig=orig_write) -> None:
-            ref._pending += len(data)
-            _LOGGER.debug("RS485 echo filter: sent %d bytes, pending echo=%d", len(data), ref._pending)
-            _orig(data)
-
-        transport.write = _tracked_write  # type: ignore[method-assign]
-        self._inner.connection_made(transport)
-
-    def data_received(self, data: bytes) -> None:
-        if self._pending:
-            skip = min(self._pending, len(data))
-            self._pending -= skip
-            _LOGGER.debug(
-                "RS485 echo filter: skipped %d echo bytes, remaining pending=%d, leftover=%d",
-                skip, self._pending, len(data) - skip,
-            )
-            data = data[skip:]
+    def _st_read_ready(self: _SerialTransport) -> None:  # type: ignore[misc]
+        """Read from serial, strip pending echo bytes, forward remainder to protocol."""
+        import serial as _serial  # local import: serial may not be installed in test env
+        try:
+            data = self.sync_serial.read(1024)
             if not data:
                 return
-        self._inner.data_received(data)
+            pending = _echo_pending.get(id(self), 0)
+            if pending:
+                skip = min(len(data), pending)
+                _echo_pending[id(self)] = pending - skip
+                # Use getLogger directly: _LOGGER not yet defined at patch time
+                import logging as _logging
+                _logging.getLogger(__name__).debug(
+                    "RS485 echo filter: skipped %d/%d echo bytes, pending now %d",
+                    skip, len(data), _echo_pending[id(self)],
+                )
+                data = data[skip:]
+                if not data:
+                    return
+            self.intern_protocol.data_received(data)  # type: ignore[attr-defined]
+        except _serial.SerialException as exc:
+            self.close(exc=exc)  # type: ignore[attr-defined]
 
-    def connection_lost(self, exc: Exception | None) -> None:
-        self._inner.connection_lost(exc)
-
-    def eof_received(self) -> bool | None:
-        return self._inner.eof_received()  # type: ignore[return-value]
-
-    def pause_writing(self) -> None:
-        self._inner.pause_writing()
-
-    def resume_writing(self) -> None:
-        self._inner.resume_writing()
-
-
-_original_serial_callback = (
-    _ModbusSerialServer.callback_new_connection if _ModbusSerialServer is not None else None
-)
-
-
-def _echo_filtered_callback(self):  # type: ignore[misc]
-    """Wrap the ServerRequestHandler in the echo filter before pymodbus uses it."""
-    return _RS485EchoFilter(_original_serial_callback(self))
-
-
-if _ModbusSerialServer is not None:
-    _ModbusSerialServer.callback_new_connection = _echo_filtered_callback  # type: ignore[method-assign]
+    _SerialTransport.write = _st_write          # type: ignore[method-assign]
+    _SerialTransport.intern_read_ready = _st_read_ready  # type: ignore[method-assign]
 # ── End RS485 Echo Filter ─────────────────────────────────────────────────────
 
 # Maps register constant names (e.g. "PHASE_1_VOLTAGE") to their PDU addresses.
@@ -163,15 +136,17 @@ SDM630_PORT: str = "/dev/ttyUSB0"
 async def start_modbus_server() -> None:
     """Start the Modbus RTU serial server."""
     try:
-        if _ModbusSerialServer is not None:
+        if _SerialTransport is not None:
             _LOGGER.warning(
-                "RS485 echo filter: ACTIVE — transport-level echo suppression via %s",
-                _ModbusSerialServer.callback_new_connection.__name__,
+                "RS485 echo filter: ACTIVE — SerialTransport.intern_read_ready patched "
+                "(write=%s, read=%s)",
+                _SerialTransport.write.__name__,
+                _SerialTransport.intern_read_ready.__name__,
             )
         else:
             _LOGGER.warning(
-                "RS485 echo filter: INACTIVE — ModbusSerialServer not importable "
-                "(test environment?); echo bytes will not be filtered."
+                "RS485 echo filter: INACTIVE — SerialTransport not importable; "
+                "echo bytes will pollute the recv_buffer."
             )
         _LOGGER.info("Starting SDM630 Modbus Serial Simulator on %s...", SDM630_PORT)
         await StartAsyncSerialServer(
