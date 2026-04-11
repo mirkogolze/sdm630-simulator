@@ -114,7 +114,8 @@ fehl, und `sent_buffer` wird dann auf `b""` zurückgesetzt → Echo landet im Bu
 | ModbusProtocol Monkey-Patch (datagram_received) | gering | – | ❌ `sent_buffer` im async-Pfad leer |
 | Hardware-Austausch CH348L → FT232RNL | €15 | Kein Echo erwartet | ❌ RC-Delay identisch |
 | asyncio Transport-Level Filter (`_RS485EchoFilter`) | mittel | – | ❌ `connection_made` timing-Race, Filter nie aktiv |
-| SerialTransport Klassen-Patch (`_st_write`/`_st_read_ready`) | mittel | Vollständig (byte-count, pyserial-Ebene) | ✅ deployed, Test ausstehend |
+| SerialTransport Klassen-Patch (`_st_write`/`_st_read_ready`) | mittel | Vollständig (byte-count, pyserial-Ebene) | ❌ asyncio bound-method capture, `_st_read_ready` nie aufgerufen |
+| `SerialTransport.setup()`-Patch (`remove_reader`/`add_reader`) | mittel | Vollständig (asyncio loop-Ebene) | 🔄 deployed, Test ausstehend |
 
 ## Lösungsplan mit Fallback
 
@@ -321,26 +322,108 @@ SerialTransport.write = _st_write
 SerialTransport.intern_read_ready = _st_read_ready
 ```
 
-### Warum dieser Ansatz funktioniert (wo alle anderen scheiterten)
+### Root-Cause des Scheiterns (2026-04-11 bewiesen)
 
-| Eigenschaft | `handle_local_echo` | asyncio Protocol-Filter | SerialTransport-Patch |
-| --- | --- | --- | --- |
-| Greift auf `sent_buffer` zu | ja — leer (async bug) | nein | **nein — zählt Bytes** |
-| Content-Vergleich | `startswith` | nein | **keiner** |
-| Korrumpiertes Echo | nein | nein | **ja** |
-| Timing-Race möglich | nein | **ja** | **nein** |
-| Pymodbus-Interna | ja | teilweise | **nein** |
-| HAOS-Versionsrisiko | hoch | mittel | **gering** |
+`SerialTransport.setup()` (Quellcode `serialtransport.py:45`) registriert den Callback so:
+
+```python
+def setup(self) -> None:
+    self.async_loop.add_reader(self.sync_serial.fileno(), self.intern_read_ready)
+    self.async_loop.call_soon(self.intern_protocol.connection_made, self)
+```
+
+`self.intern_read_ready` wird **zum Zeitpunkt des `add_reader()`-Aufrufs** ausgewertet —
+das Ergebnis ist ein gebundenes Methodenobjekt (`bound method`) das direkt auf die
+Original-Implementierung zeigt. Der asyncio Loop speichert dieses Objekt als Callback.
+
+Unser Klassen-Patch `SerialTransport.intern_read_ready = _st_read_ready` kommt beim
+Modul-Import vor der Instanziierung — aber das spielt keine Rolle: `setup()` wird aufgerufen
+**nachdem** die Instanz existiert, und `self.intern_read_ready` schlägt dabei zuerst im
+Instanz-`__dict__` nach, findet dort nichts, und findet die Klassen-Methode — aber
+das zurückgegebene bound-method-Objekt ist eine **Kopie** zum Zeitpunkt des Lookups.
+Nach dem `add_reader()`-Aufruf hat der Loop einen direkten Pointer auf diese Kopie —
+spätere Änderungen an der Klasse ändern diesen Pointer nicht mehr.
+
+**Beweis aus dem Log (2026-04-04T19-53-16):** Null `RS485 echo filter: skipped X bytes`
+Meldungen — `_st_read_ready` wurde **nie aufgerufen**.
+
+**Konsequenz:** Der `_st_write`-Patch (write-Seite) funktioniert, weil Python bei jedem
+`instance.write(data)`-Aufruf den MRO neu traversiert. `_echo_pending` wurde korrekt
+befüllt — aber niemals geleert, da die Read-Seite nie gefiltert hat.
+
+## Phase 7 — `SerialTransport.setup()`-Patch (2026-04-11, deployed)
+
+### Grundprinzip
+
+Statt `intern_read_ready` auf Klassenebene zu ersetzen (was den bereits registrierten
+asyncio-Callback nicht ändert), patchen wir `setup()` selbst. Nach dem originalen
+`setup()`-Aufruf (der `add_reader` mit der Original-Methode aufgerufen hat) ersetzen
+wir den registrierten Callback durch unseren Filter:
+
+```text
+_patched_setup() aufgerufen
+    → _orig_st_setup() aufrufen  (registriert Original-Callback via add_reader)
+    → loop.remove_reader(fd)     (entfernt Original-Callback)
+    → loop.add_reader(fd, lambda: _st_read_ready_impl(self))  (unser Filter)
+```
+
+Kein Binding-Problem — wir operieren direkt auf dem asyncio Event-Loop nach dem
+Originalpfad. Der Loop hält danach unsere Lambda-Funktion, nicht die Original-Methode.
+
+### Implementierung
+
+```python
+_echo_pending: dict[int, int] = {}  # id(instance) → ausstehende Echo-Bytes
+
+def _st_write(self, data):
+    _echo_pending[id(self)] = _echo_pending.get(id(self), 0) + len(data)
+    _orig_st_write(self, data)
+
+def _st_read_ready_impl(transport):   # kein self — kein Binding-Problem
+    data = transport.sync_serial.read(1024)
+    if not data:
+        return
+    pending = _echo_pending.get(id(transport), 0)
+    if pending:
+        skip = min(len(data), pending)
+        _echo_pending[id(transport)] = pending - skip
+        data = data[skip:]
+        if not data:
+            return
+    transport.intern_protocol.data_received(data)
+
+_orig_st_setup = SerialTransport.setup
+
+def _patched_setup(self, *args, **kwargs):
+    _orig_st_setup(self, *args, **kwargs)         # registriert Original-Callback
+    if not self.force_poll:                        # force_poll=True → polling_task, kein add_reader
+        fd = self.sync_serial.fileno()
+        self.async_loop.remove_reader(fd)          # entfernt Original-Callback
+        self.async_loop.add_reader(fd, lambda: _st_read_ready_impl(self))  # unser Filter
+
+SerialTransport.setup = _patched_setup
+SerialTransport.write = _st_write
+```
+
+### Warum der `setup()`-Patch das Binding-Problem löst
+
+| Eigenschaft | Klassen-Patch `intern_read_ready` | `setup()`-Patch |
+| --- | --- | --- |
+| asyncio Callback nach Patch | **Original-Bound-Method** (patch wirkungslos) | **Unsere Lambda** (ersetzt via `remove_reader`) |
+| Zeitpunkt der Registrierung | vor `add_reader` — zu früh | **nach** `add_reader` — korrekt |
+| Binding-Problem | **ja** | **nein** |
+| `force_poll`-Guard (Windows) | nein | **ja** |
 
 ### Erwartete Log-Ausgabe nach Deploy
 
 ```log
-WARNING ... RS485 echo filter: ACTIVE — SerialTransport.intern_read_ready patched
-            (write=_st_write, read=_st_read_ready)
+WARNING ... RS485 echo filter: SerialTransport.setup() patch INSTALLED
+WARNING ... RS485 echo filter: asyncio reader replaced on fd=XX — ACTIVE
 DEBUG   ... RS485 echo filter: skipped 9/9 echo bytes, pending now 0
 ```
 
-Danach: **keine** `Frame check failed`-Einträge mehr.
+Wenn nur die erste Zeile erscheint, aber nicht die zweite: `setup()` wurde nicht
+aufgerufen — Transport-Initialisierungssequenz weicht ab.
 
 ### Testergebnis
 
@@ -371,7 +454,10 @@ logger:
 - [x] ModbusProtocol Monkey-Patch → funktionslos (`sent_buffer` im async-Pfad nie gesetzt)
 - [x] Hardware-Austausch CH348L → FT232RNL (Waveshare Industrial) → kein Unterschied, RC-Delay-Architektur identisch
 - [x] asyncio Transport-Level Filter (`_RS485EchoFilter`) → `connection_made` Timing-Race, write-Hook nie aktiv
-- [ ] SerialTransport Klassen-Patch (`_st_write`/`_st_read_ready`) → deployed, Test ausstehend
+- [x] SerialTransport Klassen-Patch (`_st_write`/`_st_read_ready`) → gescheitert: asyncio
+  bound-method capture — `add_reader` speichert Bound-Method zum Zeitpunkt des Aufrufs,
+  class-level Patch ändert registrierten Callback nicht
+- [ ] `SerialTransport.setup()`-Patch (`remove_reader`/`add_reader`) → deployed, Test ausstehend
 
 ## Bus-Topologie
 

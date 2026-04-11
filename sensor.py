@@ -16,7 +16,6 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.util import dt as dt_util
-import asyncio
 from pymodbus.server import StartAsyncSerialServer
 from pymodbus.framer import FramerType
 try:
@@ -37,58 +36,89 @@ from . import sdm630_input_registers as _input_regs
 from . import CONF_ENTITIES, CONF_REGISTER_MAPPINGS, DEFAULTS, DOMAIN
 
 
-# ── RS485 Echo Filter — SerialTransport class-level patch ─────────────────────
+# ── RS485 Echo Filter — SerialTransport.setup() patch ────────────────────────
 # RC-delay adapters (Waveshare FT232RNL + SP485EEN) echo every sent byte back
-# on RX. The echo bytes are bit-corrupted so pymodbus's built-in
-# handle_local_echo (content startswith check) never matches. The protocol-
-# wrapper approach (_RS485EchoFilter) also failed: connection_made is invoked
-# via call_soon AFTER add_reader, so data can arrive before the write-hook is
-# installed.
+# on RX. Patching SerialTransport.intern_read_ready at class level FAILED:
+# setup() calls add_reader(fd, self.intern_read_ready) which captures a bound
+# method object at call time — the class-level replacement was never invoked.
 #
-# This patch operates at the pyserial I/O layer, one level below asyncio:
-#   - SerialTransport.write()           → counts bytes going out (_echo_pending)
-#   - SerialTransport.intern_read_ready() → discards leading pending bytes
-#     BEFORE passing data to the protocol (i.e. before pymodbus ever sees them)
+# Source: serialtransport.py:45
+#   self.async_loop.add_reader(self.sync_serial.fileno(), self.intern_read_ready)
 #
-# Safe because at 9600 baud the echo window is ~100 ms and THOR polls every
-# ~60 s, so echo and real requests never overlap.
+# Fix: patch setup() itself. After _orig_st_setup() runs (registering the
+# original callback), call remove_reader(fd) / add_reader(fd, our_filter) to
+# replace the already-registered callback. No binding problem — we operate
+# directly on the asyncio event loop.
+#
+# force_poll guard: on Windows os.name=="nt" pymodbus uses polling_task, not
+# add_reader. HAOS (Linux) always uses add_reader (force_poll=False).
 _echo_pending: dict[int, int] = {}   # id(SerialTransport instance) → pending echo bytes
 
 if _SerialTransport is not None:
     _orig_st_write = _SerialTransport.write
-    _orig_st_read_ready = _SerialTransport.intern_read_ready
 
     def _st_write(self: _SerialTransport, data: bytes) -> None:  # type: ignore[misc]
         """Track outgoing bytes so the matching echo can be discarded on RX."""
         _echo_pending[id(self)] = _echo_pending.get(id(self), 0) + len(data)
         _orig_st_write(self, data)
 
-    def _st_read_ready(self: _SerialTransport) -> None:  # type: ignore[misc]
-        """Read from serial, strip pending echo bytes, forward remainder to protocol."""
+    def _st_read_ready_impl(transport: _SerialTransport) -> None:
+        """Echo-filtering read callback: strips pending echo bytes before forwarding."""
         import serial as _serial  # local import: serial may not be installed in test env
         try:
-            data = self.sync_serial.read(1024)
+            data = transport.sync_serial.read(1024)
             if not data:
                 return
-            pending = _echo_pending.get(id(self), 0)
+            pending = _echo_pending.get(id(transport), 0)
             if pending:
                 skip = min(len(data), pending)
-                _echo_pending[id(self)] = pending - skip
-                # Use getLogger directly: _LOGGER not yet defined at patch time
+                _echo_pending[id(transport)] = pending - skip
                 import logging as _logging
                 _logging.getLogger(__name__).debug(
                     "RS485 echo filter: skipped %d/%d echo bytes, pending now %d",
-                    skip, len(data), _echo_pending[id(self)],
+                    skip, len(data), _echo_pending[id(transport)],
                 )
                 data = data[skip:]
                 if not data:
                     return
-            self.intern_protocol.data_received(data)  # type: ignore[attr-defined]
+            transport.intern_protocol.data_received(data)  # type: ignore[attr-defined]
         except _serial.SerialException as exc:
-            self.close(exc=exc)  # type: ignore[attr-defined]
+            transport.close(exc=exc)  # type: ignore[attr-defined]
+
+    if hasattr(_SerialTransport, "setup"):
+        _orig_st_setup = _SerialTransport.setup
+
+        def _patched_setup(self: _SerialTransport, *args, **kwargs) -> None:  # type: ignore[misc]
+            """Replace asyncio reader after original setup() registers it."""
+            _orig_st_setup(self, *args, **kwargs)
+            if not self.force_poll:  # force_poll=True uses polling_task, not add_reader
+                import logging as _logging
+                _log = _logging.getLogger(__name__)
+                try:
+                    fd = self.sync_serial.fileno()
+                    self.async_loop.remove_reader(fd)
+                    self.async_loop.add_reader(fd, lambda: _st_read_ready_impl(self))
+                    _log.warning(
+                        "RS485 echo filter: asyncio reader replaced on fd=%d — ACTIVE",
+                        fd,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning(
+                        "RS485 echo filter: reader replacement failed: %s", exc
+                    )
+
+        _SerialTransport.setup = _patched_setup  # type: ignore[method-assign]
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "RS485 echo filter: SerialTransport.setup() patch INSTALLED"
+        )
+    else:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "RS485 echo filter: SerialTransport.setup() NOT FOUND — echo filtering disabled"
+        )
 
     _SerialTransport.write = _st_write          # type: ignore[method-assign]
-    _SerialTransport.intern_read_ready = _st_read_ready  # type: ignore[method-assign]
 # ── End RS485 Echo Filter ─────────────────────────────────────────────────────
 
 # Maps register constant names (e.g. "PHASE_1_VOLTAGE") to their PDU addresses.
