@@ -52,14 +52,20 @@ from . import CONF_ENTITIES, CONF_REGISTER_MAPPINGS, DEFAULTS, DOMAIN
 #
 # force_poll guard: on Windows os.name=="nt" pymodbus uses polling_task, not
 # add_reader. HAOS (Linux) always uses add_reader (force_poll=False).
+# Port-selective echo filtering: only the SDM630 serial port gets filtered.
+# Other SerialTransport instances (e.g. Growatt client on ttyACM0) are untouched.
+# Populated in start_modbus_server() before StartAsyncSerialServer is called.
+_echo_filter_ports: set[str] = set()
 _echo_pending: dict[int, int] = {}   # id(SerialTransport instance) → pending echo bytes
 
 if _SerialTransport is not None:
     _orig_st_write = _SerialTransport.write
 
     def _st_write(self: _SerialTransport, data: bytes) -> None:  # type: ignore[misc]
-        """Track outgoing bytes so the matching echo can be discarded on RX."""
-        _echo_pending[id(self)] = _echo_pending.get(id(self), 0) + len(data)
+        """Track outgoing bytes — only count echo for the SDM simulator port."""
+        port = getattr(self.sync_serial, "port", None)
+        if port in _echo_filter_ports:
+            _echo_pending[id(self)] = _echo_pending.get(id(self), 0) + len(data)
         _orig_st_write(self, data)
 
     def _st_read_ready_impl(transport: _SerialTransport) -> None:
@@ -89,8 +95,11 @@ if _SerialTransport is not None:
         _orig_st_setup = _SerialTransport.setup
 
         def _patched_setup(self: _SerialTransport, *args, **kwargs) -> None:  # type: ignore[misc]
-            """Replace asyncio reader after original setup() registers it."""
+            """Replace asyncio reader — only for the SDM simulator port."""
             _orig_st_setup(self, *args, **kwargs)
+            port = getattr(self.sync_serial, "port", None)
+            if port not in _echo_filter_ports:
+                return  # Not our port (e.g. Growatt client) — leave reader untouched
             if not self.force_poll:  # force_poll=True uses polling_task, not add_reader
                 import logging as _logging
                 _log = _logging.getLogger(__name__)
@@ -99,18 +108,18 @@ if _SerialTransport is not None:
                     self.async_loop.remove_reader(fd)
                     self.async_loop.add_reader(fd, lambda: _st_read_ready_impl(self))
                     _log.warning(
-                        "RS485 echo filter: asyncio reader replaced on fd=%d — ACTIVE",
-                        fd,
+                        "RS485 echo filter: asyncio reader replaced on fd=%d port=%s — ACTIVE",
+                        fd, port,
                     )
                 except Exception as exc:  # noqa: BLE001
                     _log.warning(
-                        "RS485 echo filter: reader replacement failed: %s", exc
+                        "RS485 echo filter: reader replacement failed on %s: %s", port, exc
                     )
 
         _SerialTransport.setup = _patched_setup  # type: ignore[method-assign]
         import logging as _logging
         _logging.getLogger(__name__).warning(
-            "RS485 echo filter: SerialTransport.setup() patch INSTALLED"
+            "RS485 echo filter: SerialTransport.setup() patch INSTALLED (port-selective)"
         )
     else:
         import logging as _logging
@@ -166,18 +175,9 @@ SDM630_PORT: str = "/dev/ttyUSB0"
 async def start_modbus_server() -> None:
     """Start the Modbus RTU serial server."""
     try:
-        if _SerialTransport is not None:
-            _LOGGER.warning(
-                "RS485 echo filter: ACTIVE — SerialTransport.intern_read_ready patched "
-                "(write=%s, read=%s)",
-                _SerialTransport.write.__name__,
-                _SerialTransport.intern_read_ready.__name__,
-            )
-        else:
-            _LOGGER.warning(
-                "RS485 echo filter: INACTIVE — SerialTransport not importable; "
-                "echo bytes will pollute the recv_buffer."
-            )
+        # Register our port for echo filtering before StartAsyncSerialServer
+        # creates the SerialTransport (which calls setup() → _patched_setup).
+        _echo_filter_ports.add(SDM630_PORT)
         _LOGGER.info("Starting SDM630 Modbus Serial Simulator on %s...", SDM630_PORT)
         await StartAsyncSerialServer(
             context=context,
