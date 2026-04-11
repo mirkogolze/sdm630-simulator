@@ -38,35 +38,32 @@ from . import CONF_ENTITIES, CONF_REGISTER_MAPPINGS, DEFAULTS, DOMAIN
 
 # ── RS485 Echo Filter — SerialTransport.setup() patch ────────────────────────
 # RC-delay adapters (Waveshare FT232RNL + SP485EEN) echo every sent byte back
-# on RX. Patching SerialTransport.intern_read_ready at class level FAILED:
-# setup() calls add_reader(fd, self.intern_read_ready) which captures a bound
-# method object at call time — the class-level replacement was never invoked.
+# on RX.
 #
-# Source: serialtransport.py:45
-#   self.async_loop.add_reader(self.sync_serial.fileno(), self.intern_read_ready)
+# History of failed approaches:
+#   - Class-level intern_read_ready patch: asyncio captures bound method at
+#     add_reader() time — class patch invisible to already-registered callback.
+#   - Class-level write patch (_st_write): _echo_pending never incremented in
+#     practice — suspected cause: pymodbus or asyncio.Transport caches the
+#     write method on the instance, shadowing the class-level patch.
 #
-# Fix: patch setup() itself. After _orig_st_setup() runs (registering the
-# original callback), call remove_reader(fd) / add_reader(fd, our_filter) to
-# replace the already-registered callback. No binding problem — we operate
-# directly on the asyncio event loop.
+# Current approach (Phase 8):
+#   Both fixes applied as INSTANCE attributes inside _patched_setup(), where
+#   we have the concrete SerialTransport instance in hand:
+#     1. self.write = _instance_write_tracker   → instance attr, Python finds
+#        it before any class method — guaranteed to be called
+#     2. remove_reader + add_reader(lambda _st_read_ready_impl) → replaces the
+#        asyncio callback registered by _orig_st_setup
 #
-# force_poll guard: on Windows os.name=="nt" pymodbus uses polling_task, not
-# add_reader. HAOS (Linux) always uses add_reader (force_poll=False).
-# Port-selective echo filtering: only the SDM630 serial port gets filtered.
-# Other SerialTransport instances (e.g. Growatt client on ttyACM0) are untouched.
+# Port-selective: only _echo_filter_ports entries get filtered.
 # Populated in start_modbus_server() before StartAsyncSerialServer is called.
 _echo_filter_ports: set[str] = set()
 _echo_pending: dict[int, int] = {}   # id(SerialTransport instance) → pending echo bytes
 
 if _SerialTransport is not None:
+    # Capture the ORIGINAL write before any patching — used as call target
+    # inside the instance-level tracker closure.
     _orig_st_write = _SerialTransport.write
-
-    def _st_write(self: _SerialTransport, data: bytes) -> None:  # type: ignore[misc]
-        """Track outgoing bytes — only count echo for the SDM simulator port."""
-        port = getattr(self.sync_serial, "port", None)
-        if port in _echo_filter_ports:
-            _echo_pending[id(self)] = _echo_pending.get(id(self), 0) + len(data)
-        _orig_st_write(self, data)
 
     def _st_read_ready_impl(transport: _SerialTransport) -> None:
         """Echo-filtering read callback: strips pending echo bytes before forwarding."""
@@ -95,25 +92,37 @@ if _SerialTransport is not None:
         _orig_st_setup = _SerialTransport.setup
 
         def _patched_setup(self: _SerialTransport, *args, **kwargs) -> None:  # type: ignore[misc]
-            """Replace asyncio reader — only for the SDM simulator port."""
+            """Inject echo filter on the SDM simulator port after original setup."""
             _orig_st_setup(self, *args, **kwargs)
             port = getattr(self.sync_serial, "port", None)
             if port not in _echo_filter_ports:
-                return  # Not our port (e.g. Growatt client) — leave reader untouched
+                return  # Not our port (e.g. Growatt client) — leave untouched
             if not self.force_poll:  # force_poll=True uses polling_task, not add_reader
                 import logging as _logging
                 _log = _logging.getLogger(__name__)
+                fd = self.sync_serial.fileno()
                 try:
-                    fd = self.sync_serial.fileno()
+                    # ── Write tracker (INSTANCE attribute) ──────────────────
+                    # Python resolves instance.__dict__ before class methods,
+                    # so this is guaranteed to be called regardless of how
+                    # pymodbus dispatches transport.write().
+                    def _instance_write(data: bytes, _t=self, _orig=_orig_st_write) -> None:
+                        _echo_pending[id(_t)] = _echo_pending.get(id(_t), 0) + len(data)
+                        _orig(_t, data)  # call original SerialTransport.write
+
+                    self.write = _instance_write  # type: ignore[method-assign]
+
+                    # ── Read filter (asyncio callback replacement) ───────────
                     self.async_loop.remove_reader(fd)
                     self.async_loop.add_reader(fd, lambda: _st_read_ready_impl(self))
                     _log.warning(
-                        "RS485 echo filter: asyncio reader replaced on fd=%d port=%s — ACTIVE",
+                        "RS485 echo filter: ACTIVE on fd=%d port=%s "
+                        "(instance write tracker + asyncio reader replaced)",
                         fd, port,
                     )
                 except Exception as exc:  # noqa: BLE001
                     _log.warning(
-                        "RS485 echo filter: reader replacement failed on %s: %s", port, exc
+                        "RS485 echo filter: setup failed on %s: %s", port, exc
                     )
 
         _SerialTransport.setup = _patched_setup  # type: ignore[method-assign]
@@ -126,8 +135,6 @@ if _SerialTransport is not None:
         _logging.getLogger(__name__).warning(
             "RS485 echo filter: SerialTransport.setup() NOT FOUND — echo filtering disabled"
         )
-
-    _SerialTransport.write = _st_write          # type: ignore[method-assign]
 # ── End RS485 Echo Filter ─────────────────────────────────────────────────────
 
 # Maps register constant names (e.g. "PHASE_1_VOLTAGE") to their PDU addresses.
